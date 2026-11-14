@@ -1,0 +1,443 @@
+package com.personaldisciplineshield
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.app.admin.DevicePolicyManager
+import android.content.ComponentName
+import android.content.Intent
+import android.graphics.Typeface
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import android.text.InputType
+import android.widget.*
+
+class AdvancedActivity : Activity() {
+    private lateinit var lockStatus: TextView
+    private lateinit var adminStatus: TextView
+    private lateinit var a11yStatus: TextView
+    private lateinit var imageStatus: TextView
+    private lateinit var kwList: LinearLayout
+    private lateinit var allowedList: LinearLayout
+    private lateinit var blockedView: TextView
+    private lateinit var diagView: TextView
+    private lateinit var blockedAppsView: TextView
+    private lateinit var lockdownStatusView: TextView
+    private lateinit var waStatusView: TextView
+    private lateinit var dotView: TextView
+    // Settings-type apps are handled by the Settings lockdown, never by the app blocker.
+    private val hiddenApps: Set<String> by lazy {
+        val home = packageManager.resolveActivity(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0
+        )?.activityInfo?.packageName
+        setOf(
+            "com.android.settings", "com.miui.securitycenter", "com.miui.powerkeeper",
+            "com.android.systemui", "com.android.phone", "com.android.server.telecom",
+            "com.google.android.permissioncontroller", "com.android.permissioncontroller",
+            "com.google.android.packageinstaller", "com.android.packageinstaller",
+            "com.miui.packageinstaller", "com.coloros.safecenter", "com.oplus.settings",
+            "com.coloros.settings", "com.android.providers.settings"
+        ) + listOfNotNull(home)
+    }
+    private lateinit var content: LinearLayout
+    private val admin by lazy { ComponentName(this, ShieldAdminReceiver::class.java) }
+    private val dpm by lazy { getSystemService(DevicePolicyManager::class.java) }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun lp() = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5); bottomMargin = dp(5) }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(22), dp(20), dp(20))
+        }
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(0xFFF5F6FA.toInt())
+            addView(content)
+        }
+        setContentView(scroll)
+        build()
+    }
+
+    override fun onResume() { super.onResume(); if (::lockStatus.isInitialized) refresh() }
+
+    private fun section(t: String) = content.addView(TextView(this).apply {
+        text = t; textSize = 14f; setTypeface(null, Typeface.BOLD)
+        setTextColor(0xFF344054.toInt()); setPadding(0, dp(18), 0, dp(5))
+    })
+
+    private fun note(t: String) = TextView(this).apply {
+        text = t; textSize = 12f; setTextColor(0xFF6B7280.toInt()); setPadding(0, dp(4), 0, dp(4))
+    }
+
+    private fun button(t: String, onClick: () -> Unit) = Button(this).apply {
+        text = t; setOnClickListener { onClick() }
+    }
+
+    private fun toggle(title: String, key: String, default: Boolean, onChanged: (() -> Unit)? = null) {
+        content.addView(Switch(this).apply {
+            text = title; textSize = 15f
+            isChecked = Prefs.enabled(this@AdvancedActivity, key, default)
+            setOnCheckedChangeListener { v, on ->
+                if (!on && !Guard.require(this@AdvancedActivity)) { v.isChecked = true; return@setOnCheckedChangeListener }
+                Prefs.setEnabled(this@AdvancedActivity, key, on)
+                onChanged?.invoke()
+            }
+        }, lp())
+    }
+
+    private fun ask(title: String, password: Boolean, onOk: (String) -> Unit) {
+        val et = EditText(this).apply {
+            inputType = if (password) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            else InputType.TYPE_CLASS_TEXT
+        }
+        AlertDialog.Builder(this).setTitle(title).setView(et)
+            .setPositiveButton("OK") { _, _ -> onOk(et.text.toString().trim()) }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun build() {
+        content.addView(TextView(this).apply {
+            val ver = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "?" }
+            text = "Advanced protection  (build $ver)"; textSize = 22f
+            setTypeface(null, Typeface.BOLD); setTextColor(0xFF172033.toInt())
+        })
+
+        // ---- Lock ----
+        section("IMPULSE LOCK (password + waiting time)")
+        lockStatus = TextView(this).apply { textSize = 14f }
+        content.addView(lockStatus)
+        content.addView(button("Set / change password") {
+            if (Guard.hasPin(this) && !Guard.require(this)) return@button
+            ask("New password (${Guard.MIN_LENGTH}+ characters; letters, numbers, symbols)", true) { first ->
+                if (first.length < Guard.MIN_LENGTH) { toast("At least ${Guard.MIN_LENGTH} characters"); return@ask }
+                ask("Type the password again", true) { second ->
+                    if (first != second) toast("Passwords did not match, nothing changed")
+                    else { Guard.setPin(this, first); toast("Password set. Protection is now locked."); refresh() }
+                }
+            }
+        }, lp())
+        content.addView(button("Request unlock (starts ${Guard.DELAY_MS / 60000}-min wait)") {
+            if (!Guard.hasPin(this)) { toast("Set a password first"); return@button }
+            val wait = Guard.lockoutMs(this)
+            if (wait > 0) { toast("Too many wrong attempts. Try again in ${wait / 60000 + 1} min"); return@button }
+            ask("Enter password", true) { pw ->
+                if (Guard.checkPin(this, pw)) { Guard.requestUnlock(this); toast("Unlock opens after the wait"); refresh() }
+                else {
+                    val w = Guard.lockoutMs(this)
+                    toast(if (w > 0) "Wrong password. Locked out for ${w / 60000 + 1} min" else "Wrong password")
+                }
+            }
+        }, lp())
+        content.addView(button("Lock now") { Guard.lock(this); refresh() }, lp())
+        content.addView(note("Tip: ask a trusted person to set the password so you do not know it. New passwords need ${Guard.MIN_LENGTH}+ characters (a password set earlier keeps working until you change it). After 5 wrong tries you are locked out for a while."))
+
+        // ---- Device admin ----
+        section("DEVICE ADMIN (uninstall speed-bump + screen lock)")
+        adminStatus = TextView(this).apply { textSize = 14f }
+        content.addView(adminStatus)
+        content.addView(button("Enable Device Admin") {
+            startActivity(Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, admin)
+                .putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                    "Makes uninstalling require removing this admin first, and lets Shield lock the screen after repeated blocked attempts."))
+        }, lp())
+        content.addView(button("Remove Device Admin (needs unlock)") {
+            if (!Guard.require(this)) return@button
+            dpm.removeActiveAdmin(admin); refresh()
+        }, lp())
+
+        // ---- Accessibility ----
+        section("ACCESSIBILITY SERVICE (keywords, apps, settings guard, images)")
+        a11yStatus = TextView(this).apply { textSize = 14f }
+        content.addView(a11yStatus)
+        content.addView(button("Open Accessibility settings") {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }, lp())
+        content.addView(note("Android 13+ sideloaded apps: first open App info > ⋮ > Allow restricted settings."))
+        toggle("Guard Settings / uninstall screens", Prefs.SETTINGS_GUARD, true)
+
+        // ---- MIUI / Redmi helpers ----
+        section("MIUI / REDMI SETUP (do this BEFORE setting the password)")
+        content.addView(button("1. Autostart: turn ON for this app") {
+            openOrDetails(Intent().setClassName("com.miui.securitycenter",
+                "com.miui.permcenter.autostart.AutoStartManagementActivity"))
+        }, lp())
+        content.addView(button("2. Battery saver: choose No restrictions") {
+            openOrDetails(Intent().setClassName("com.miui.powerkeeper",
+                "com.miui.powerkeeper.ui.HiddenAppsConfigActivity")
+                .putExtra("package_name", packageName)
+                .putExtra("package_label", "Personal Discipline Shield"))
+        }, lp())
+        content.addView(button("App details page") { openOrDetails(null) }, lp())
+        content.addView(note("3. Open Recents, then long-press (or pull down on) this app's card and tap the lock icon so 'Clear all' cannot kill it. MIUI otherwise stops the VPN and the accessibility service in the background."))
+
+        // ---- Settings lockdown ----
+        section("SETTINGS APP LOCKDOWN (allow only some pages)")
+        toggle("Lock Settings app (only pages listed below stay open)", Prefs.SETTINGS_LOCKDOWN, false) { refresh() }
+        lockdownStatusView = TextView(this).apply { textSize = 13f; setTypeface(null, Typeface.BOLD) }
+        content.addView(lockdownStatusView)
+        content.addView(button("Open Wi-Fi settings") { openSettings(Settings.ACTION_WIFI_SETTINGS) }, lp())
+        content.addView(button("Open Bluetooth settings") { openSettings(Settings.ACTION_BLUETOOTH_SETTINGS) }, lp())
+        content.addView(button("Open Hotspot settings") { openHotspot() }, lp())
+        content.addView(note("Wi-Fi, Bluetooth and Hotspot also work from the Quick Settings tiles (swipe down); those are never blocked. Long-press a tile to open its page. Lockdown is active whenever the switch is ON, even during the unlock window. To use Settings: unlock, switch this off, do what you need, then switch it on again."))
+        val allowInput = EditText(this).apply { hint = "allowed page title, e.g. wi-fi"; setSingleLine(true) }
+        content.addView(allowInput, lp())
+        content.addView(button("Allow this Settings page title") {
+            if (!Guard.require(this)) return@button
+            val t = allowInput.text.toString().trim().lowercase()
+            if (t.length < 3) { toast("At least 3 characters"); return@button }
+            val s = Prefs.allowedSettings(this).toMutableSet(); s.add(t)
+            Prefs.saveStrings(this, Prefs.ALLOWED_SETTINGS, s); allowInput.text.clear(); renderAllowed()
+        }, lp())
+        allowedList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        content.addView(allowedList)
+        content.addView(button("Reset allowed list to defaults") {
+            if (!Guard.require(this)) return@button
+            Prefs.remove(this, Prefs.ALLOWED_SETTINGS); renderAllowed()
+        }, lp())
+        blockedView = TextView(this).apply { textSize = 12f; setTextColor(0xFF6B7280.toInt()) }
+        content.addView(blockedView)
+        content.addView(note("If a page you need gets blocked, unlock, open it, then read 'Last blocked Settings screen' above and add its title."))
+        renderAllowed()
+
+        // ---- WhatsApp ----
+        section("WHATSAPP")
+        toggle("Block Channels / Updates tab in WhatsApp", Prefs.WA_CHANNELS, true)
+        content.addView(note("Chats, calls and groups stay open. Channels sit inside the Updates tab together with Status, so the whole Updates tab is blocked. WhatsApp must NOT be in your blocked apps list. Works with the English WhatsApp interface."))
+
+        waStatusView = TextView(this).apply { textSize = 12f; setTextColor(0xFF6B7280.toInt()) }
+        content.addView(waStatusView)
+
+        // ---- Keywords ----
+        section("BLOCKED KEYWORDS")
+        toggle("Keyword blocking (search boxes + browser URL bars)", Prefs.KEYWORDS_ON, true)
+        val kwInput = EditText(this).apply { hint = "keyword"; setSingleLine(true) }
+        content.addView(kwInput, lp())
+        content.addView(button("Add keyword") {
+            val k = kwInput.text.toString().trim().lowercase()
+            if (k.length < 3) { toast("At least 3 characters"); return@button }
+            val s = Prefs.strings(this, Prefs.KEYWORDS); s.add(k)
+            Prefs.saveStrings(this, Prefs.KEYWORDS, s); kwInput.text.clear(); renderKeywords()
+        }, lp())
+        kwList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        content.addView(kwList)
+        renderKeywords()
+
+        // ---- Apps ----
+        section("BLOCKED APPS")
+        toggle("App blocking", Prefs.APPS_ON, true)
+        content.addView(button("Choose apps to block") { pickApps() }, lp())
+        blockedAppsView = TextView(this).apply { textSize = 13f }
+        content.addView(blockedAppsView)
+        content.addView(button("Clear all blocked apps (needs unlock)") {
+            if (!Guard.require(this)) return@button
+            Prefs.saveStrings(this, Prefs.BLOCKED_APPS, emptySet()); refresh()
+        }, lp())
+
+        // ---- Images ----
+        section("EXPLICIT IMAGE GUARD (experimental)")
+        toggle("Scan screen for explicit images", Prefs.IMAGE_ON, false) { refresh() }
+        imageStatus = TextView(this).apply { textSize = 13f }
+        content.addView(imageStatus)
+        content.addView(note("Needs Android 11+ and a model file at assets/nsfw.tflite. Accuracy depends on the model; expect misses and false alarms."))
+
+        // ---- Encrypted DNS ----
+        section("ENCRYPTED DNS (DNS-over-TLS, strict: no plain fallback)")
+        content.addView(button("Choose DNS provider") { pickProvider() }, lp())
+        val hostInput = EditText(this).apply {
+            hint = "custom host, e.g. abc123.dns.nextdns.io"; setSingleLine(true)
+            setText(Prefs.getString(this@AdvancedActivity, Prefs.DNS_CUSTOM_HOST) ?: "")
+        }
+        val ipInput = EditText(this).apply {
+            hint = "server IP (optional; empty = look it up)"; setSingleLine(true)
+            setText(Prefs.getString(this@AdvancedActivity, Prefs.DNS_CUSTOM_IP) ?: "")
+        }
+        content.addView(hostInput, lp())
+        content.addView(ipInput, lp())
+        content.addView(button("Save custom provider and use it") {
+            if (!Guard.require(this)) return@button
+            val h = hostInput.text.toString().trim().lowercase()
+            val ips = ipInput.text.toString().split(',', ' ').map { it.trim() }.filter { it.isNotEmpty() }
+            val okHost = Regex("^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$").matches(h) && h.contains('.')
+            val okIps = ips.all { Regex("^\\d{1,3}(\\.\\d{1,3}){3}$").matches(it) }
+            if (!okHost) { toast("Enter a valid host name"); return@button }
+            if (!okIps) { toast("IP must look like 45.90.28.1"); return@button }
+            Prefs.putString(this, Prefs.DNS_CUSTOM_HOST, h)
+            Prefs.putString(this, Prefs.DNS_CUSTOM_IP, ips.joinToString(","))
+            Prefs.putString(this, Prefs.DNS_PROVIDER, "custom")
+            toast("Custom provider saved"); refresh()
+        }, lp())
+        dotView = TextView(this).apply { textSize = 13f }
+        content.addView(dotView)
+        toggle("Adult domain-name heuristic (host names containing porn, xxx ...)", Prefs.ADULT_HEURISTIC, true)
+        content.addView(note("Always encrypted. If the chosen provider cannot be reached, websites will not load (no plain-DNS fallback, and a Custom provider never switches to another one). To recover: unlock and turn protection off, or choose another provider. Your custom host stays in this app only, not in the source code."))
+
+        // ---- Diagnostics ----
+        section("DIAGNOSTICS (use this if something does not block)")
+        content.addView(Switch(this).apply {
+            text = "Record on-screen text for WhatsApp / Settings"
+            textSize = 15f
+            isChecked = Prefs.enabled(this@AdvancedActivity, Prefs.DEBUG, false)
+            setOnCheckedChangeListener { _, on -> Prefs.setEnabled(this@AdvancedActivity, Prefs.DEBUG, on) }
+        }, lp())
+        content.addView(note("Switch on, open WhatsApp > Updates tab (NOT a chat), then Settings > Wi-Fi, come back here and tap Refresh. The saved text is whatever was on screen, so never record while a private chat is open, and clear it after use."))
+        diagView = TextView(this).apply { textSize = 11f; setTextIsSelectable(true) }
+        content.addView(diagView)
+        content.addView(button("Refresh diagnostics") { refresh() }, lp())
+        content.addView(button("Clear recorded text") {
+            Prefs.remove(this, "dbg_screen_wa"); Prefs.remove(this, "dbg_screen_settings"); Prefs.remove(this, "dbg_last_event")
+            refresh()
+        }, lp())
+
+        refresh()
+    }
+
+    private fun openOrDetails(intent: Intent?) {
+        try {
+            if (intent == null) throw IllegalStateException()
+            startActivity(intent)
+        } catch (_: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                    .setData(Uri.parse("package:$packageName")))
+            } catch (_: Exception) { toast("Open Settings > Apps > Manage apps manually") }
+        }
+    }
+
+    private fun pickProvider() {
+        if (!Guard.require(this)) return
+        val ids = Prefs.DNS_PROVIDERS.keys.toList()
+        val labels = Prefs.DNS_PROVIDERS.values.toTypedArray()
+        val current = ids.indexOf(Prefs.getString(this, Prefs.DNS_PROVIDER) ?: "auto").coerceAtLeast(0)
+        AlertDialog.Builder(this).setTitle("DNS provider")
+            .setSingleChoiceItems(labels, current) { d, i ->
+                val id = ids[i]
+                if (id == "custom" && Prefs.getString(this, Prefs.DNS_CUSTOM_HOST).isNullOrBlank()) {
+                    toast("Fill in the custom host below and save it first")
+                } else {
+                    Prefs.putString(this, Prefs.DNS_PROVIDER, id)
+                    refresh()
+                }
+                d.dismiss()
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun renderAllowed() {
+        allowedList.removeAllViews()
+        Prefs.allowedSettings(this).sorted().forEach { t ->
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
+            row.addView(TextView(this).apply { text = t; textSize = 14f }, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(button("Remove") {
+                if (!Guard.require(this)) return@button
+                val s = Prefs.allowedSettings(this).toMutableSet(); s.remove(t)
+                Prefs.saveStrings(this, Prefs.ALLOWED_SETTINGS, s); renderAllowed()
+            })
+            allowedList.addView(row)
+        }
+    }
+
+    private fun openSettings(action: String) {
+        try { startActivity(Intent(action)) } catch (_: Exception) { toast("Could not open that page") }
+    }
+
+    private fun openHotspot() {
+        try {
+            startActivity(Intent().setClassName("com.android.settings", "com.android.settings.Settings\$TetherSettingsActivity"))
+        } catch (_: Exception) {
+            toast("Use the Hotspot tile in Quick Settings (swipe down)")
+        }
+    }
+
+    private fun renderKeywords() {
+        kwList.removeAllViews()
+        Prefs.strings(this, Prefs.KEYWORDS).sorted().forEach { k ->
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
+            row.addView(TextView(this).apply { text = k; textSize = 14f }, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(button("Remove") {
+                if (!Guard.require(this)) return@button
+                val s = Prefs.strings(this, Prefs.KEYWORDS); s.remove(k)
+                Prefs.saveStrings(this, Prefs.KEYWORDS, s); renderKeywords()
+            })
+            kwList.addView(row)
+        }
+    }
+
+    private fun pickApps() {
+        val pm = packageManager
+        val launch = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val apps = pm.queryIntentActivities(launch, 0)
+            .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+            .filter { it.first != packageName && it.first !in hiddenApps }
+            .distinctBy { it.first }
+            .sortedBy { it.second.lowercase() }
+        val current = Prefs.strings(this, Prefs.BLOCKED_APPS)
+        val checked = BooleanArray(apps.size) { apps[it].first in current }
+        AlertDialog.Builder(this).setTitle("Block these apps")
+            .setMultiChoiceItems(apps.map { it.second }.toTypedArray(), checked) { _, i, b -> checked[i] = b }
+            .setPositiveButton("Save") { _, _ ->
+                val chosen = apps.filterIndexed { i, _ -> checked[i] }.map { it.first }.toMutableSet()
+                // keep entries for apps no longer launchable
+                val kept = current.filter { p -> apps.none { it.first == p } }
+                chosen.addAll(kept.filter { it !in hiddenApps })
+                if (((current - hiddenApps) - chosen).isNotEmpty() && !Guard.require(this)) return@setPositiveButton
+                Prefs.saveStrings(this, Prefs.BLOCKED_APPS, chosen)
+                toast("${chosen.size} app(s) blocked")
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun appLabel(p: String): String = try {
+        packageManager.getApplicationLabel(packageManager.getApplicationInfo(p, 0)).toString()
+    } catch (_: Exception) { p }
+
+    private fun a11yEnabled(): Boolean {
+        val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
+        return s.contains(packageName + "/" + ShieldAccessibilityService::class.java.name)
+    }
+
+    private fun refresh() {
+        lockStatus.text = when {
+            !Guard.hasPin(this) -> "Lock: NOT ARMED (set a password to arm)"
+            Guard.isUnlocked(this) -> "Lock: UNLOCKED, closes in ${Guard.openRemainingMs(this) / 60000 + 1} min"
+            Guard.waitingMs(this) > 0 -> "Lock: unlock pending, opens in ${Guard.waitingMs(this) / 60000 + 1} min"
+            else -> "Lock: LOCKED"
+        }
+        adminStatus.text = if (dpm.isAdminActive(admin)) {
+            if (dpm.isDeviceOwnerApp(packageName)) "Device Admin: ACTIVE (Device Owner: hard uninstall block)"
+            else "Device Admin: ACTIVE (uninstall needs admin removal first; not a hard block)"
+        } else "Device Admin: OFF"
+        a11yStatus.text = if (a11yEnabled()) "Accessibility: ON" else "Accessibility: OFF (required for most features)"
+        val hasModel = try { assets.list("")?.contains("nsfw.tflite") == true } catch (_: Exception) { false }
+        imageStatus.text = "Model: ${if (hasModel) "found" else "missing"}  |  Android 11+: ${Build.VERSION.SDK_INT >= 30}"
+        blockedView.text = "Last blocked Settings screen: ${Prefs.getString(this, "last_settings_block") ?: "none yet"}"
+        val providerId = Prefs.getString(this, Prefs.DNS_PROVIDER) ?: "auto"
+        dotView.text = "Provider: ${Prefs.DNS_PROVIDERS[providerId] ?: providerId}\n" +
+            "Encrypted queries: ${Prefs.count(this, "dns_encrypted")}   failed: ${Prefs.count(this, "dns_encrypted_failed")}\n" +
+            "Last DNS status: ${Prefs.lastDnsError(this)}"
+        val blockedNow = Prefs.strings(this, Prefs.BLOCKED_APPS).map { appLabel(it) }.sorted()
+        blockedAppsView.text = if (blockedNow.isEmpty()) "Blocked apps: none" else "Blocked apps: " + blockedNow.joinToString(", ")
+        val armed = Guard.hasPin(this)
+        val lockdownOn = Prefs.enabled(this, Prefs.SETTINGS_LOCKDOWN, false)
+        val guardOn = Prefs.enabled(this, Prefs.SETTINGS_GUARD, true)
+        val lockdownActive = lockdownOn
+        lockdownStatusView.text = when {
+            !lockdownOn -> "Status: OFF (switch is off)"
+            else -> "Status: ACTIVE (stays locked even during the unlock window; switch it off here to use Settings)"
+        }
+        waStatusView.text = "Last WhatsApp block: ${Prefs.getString(this, "last_wa_block") ?: "none yet"}"
+        diagView.text = "Accessibility service enabled: ${a11yEnabled()}\n" +
+            "Password set: $armed   unlocked right now: ${Guard.isUnlocked(this)}\n" +
+            "Settings lockdown switch: $lockdownOn   guard switch: $guardOn\n" +
+            "=> Settings lockdown active now: $lockdownActive\n" +
+            "WhatsApp channel block switch: ${Prefs.enabled(this, Prefs.WA_CHANNELS, true)}\n" +
+            "Last event seen by service: ${Prefs.getString(this, "dbg_last_event") ?: "none (service not receiving events)"}\n\n" +
+            "--- WhatsApp screen ---\n${Prefs.getString(this, "dbg_screen_wa") ?: "-"}\n\n" +
+            "--- Settings screen ---\n${Prefs.getString(this, "dbg_screen_settings") ?: "-"}"
+    }
+
+    private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
+}
